@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.audiocapture.mixedcapture</string>
+    <key>CFBundleName</key>
+    <string>Audio Capture</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>This app needs access to your microphone to capture audio input for mixing with system audio.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>This app needs screen recording permission to capture system audio.</string>
+</dict>
+</plist>

@@ -1,3 +1,57 @@
+# Build artifacts
 build/
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+Package.resolved
+
+# Compiled binaries
+macos/audio_capture_server
+macos/audio_capture_server_fixed
+macos/capture_direct_audio
+macos/capture_mixed_audio
+macos/capture_mixed_simple
+macos/capture_with_permissions
+macos/simple_capture
+macos/test_server
+QuickRecorder
+capture_real_audio
+test_connection
+test_server
+test_server_debug
+
+# Logs and temporary files
+*.log
+server_port.txt
+capture_log.txt
+*.tmp
+*.temp
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Audio files (test outputs)
 *.wav
+*.m4a
+*.aac
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/

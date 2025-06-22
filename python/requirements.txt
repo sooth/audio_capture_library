@@ -1,0 +1,14 @@
+# Audio Capture Python Client Requirements
+
+# Core dependencies
+numpy>=1.19.0
+scipy>=1.5.0
+
+# Optional dependencies for extended examples
+# Uncomment if using the visualization features
+# matplotlib>=3.3.0
+
+# Optional dependencies for audio analysis
+# Uncomment if using advanced audio processing
+# librosa>=0.8.0
+# soundfile>=0.10.0
