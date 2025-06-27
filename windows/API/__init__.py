@@ -123,7 +123,8 @@ from .AudioBufferQueue import (
     PriorityAudioBufferQueue,
     CircularAudioBufferQueue,
     Priority,
-    QueueStatistics
+    QueueStatistics,
+    ConvertingBufferCollector
 )
 
 from .WavFileWriter import (
@@ -195,6 +196,7 @@ __all__ = [
     'CircularAudioBufferQueue',
     'Priority',
     'QueueStatistics',
+    'ConvertingBufferCollector',
     
     # File Writing
     'WavFileWriter',

@@ -10,6 +10,7 @@ A comprehensive Python audio capture and playback library for Windows, providing
 - **Multiple Output Destinations**: File, network stream, callback, or playback
 - **Device Management**: Enumerate and control audio devices
 - **Format Support**: Automatic format conversion and negotiation
+- **ConvertingBufferCollector**: Automatic sample rate conversion as buffers arrive (matches macOS pattern)
 - **Network Streaming**: TCP/IP audio streaming for inter-process communication
 - **Session-based Architecture**: Manage multiple concurrent audio operations
 
@@ -174,6 +175,49 @@ asyncio.run(play_audio())
 ```
 
 ## Advanced Features
+
+### ConvertingBufferCollector - Automatic Sample Rate Conversion
+
+The ConvertingBufferCollector pattern matches the macOS implementation, converting audio to a target format as buffers arrive rather than during mixing or export:
+
+```python
+import asyncio
+from windows.API import AudioCaptureKit, CaptureConfiguration, AudioFormat
+
+async def capture_with_conversion():
+    kit = AudioCaptureKit()
+    
+    # Configure capture with automatic conversion
+    config = CaptureConfiguration(
+        format=AudioFormat(sample_rate=44100.0, channels=2),  # Source format
+        use_converting_collector=True,  # Enable conversion
+        target_format=AudioFormat(      # Target format
+            sample_rate=48000.0,
+            channels=2,
+            bit_depth=32,
+            is_float=True
+        )
+    )
+    
+    # Start capture - conversion happens automatically
+    session = await kit.start_capture(configuration=config)
+    
+    # Capture for 10 seconds
+    await asyncio.sleep(10)
+    
+    # Get pre-converted audio
+    converted_audio = await session.get_collected_audio()
+    print(f"Collected {len(converted_audio)} samples at 48kHz")
+    
+    await kit.stop_capture(session)
+
+asyncio.run(capture_with_conversion())
+```
+
+This is particularly useful when:
+- Mixing audio from sources with different sample rates
+- Ensuring consistent format for processing
+- Matching the exact behavior of macOS AudioCaptureKit
 
 ### Device Management
 

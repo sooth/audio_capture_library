@@ -1,14 +1,21 @@
 # Windows AudioCaptureKit Requirements
 # Install with: pip install -r requirements.txt
+#
+# IMPORTANT: If you have regular PyAudio installed, you must uninstall it first:
+#   pip uninstall pyaudio
+#   pip install -r requirements.txt
+#
+# PyAudioWPatch and PyAudio conflict with each other!
 
 # Core dependencies
 numpy>=1.19.0
 scipy>=1.5.0
+librosa>=0.9.0  # High-quality audio resampling and processing
 
 # Audio libraries
 sounddevice>=0.4.5
-PyAudioWPatch>=0.2.12.5  # Fork of PyAudio with WASAPI loopback support
-pycaw>=20240316  # Windows Core Audio API wrapper
+PyAudioWPatch>=0.2.12.5  # Fork of PyAudio with WASAPI loopback support - REQUIRED for system audio recording
+pycaw>=20240210  # Windows Core Audio API wrapper
 
 # Optional dependencies for enhanced functionality
 # matplotlib>=3.3.0  # For audio visualization

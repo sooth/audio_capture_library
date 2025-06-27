@@ -19,6 +19,7 @@ from .AudioDevice import AudioDevice
 from .StreamingAudioRecorder import StreamingAudioRecorder, AudioStreamDelegate
 from .StreamingAudioPlayer import StreamingAudioPlayer
 from .AudioError import InvalidStateError, SessionNotFoundError
+from .AudioBufferQueue import ConvertingBufferCollector
 
 
 class SessionState(Enum):
@@ -54,10 +55,21 @@ class CaptureConfiguration:
     device: Optional[AudioDevice] = None
     format: Optional[AudioFormat] = None
     buffer_size: int = 1024
+    use_converting_collector: bool = False
+    target_format: Optional[AudioFormat] = None
     
     def __post_init__(self):
         if self.format is None:
             self.format = AudioFormat.default_format()
+        if self.use_converting_collector and self.target_format is None:
+            # Default target format: 48kHz stereo
+            self.target_format = AudioFormat(
+                sample_rate=48000.0,
+                channels=2,
+                bit_depth=32,
+                is_float=True,
+                is_interleaved=True
+            )
 
 
 @dataclass
@@ -79,12 +91,18 @@ class PlaybackConfiguration:
 class AudioStreamMultiplexer(AudioStreamDelegate):
     """Distributes audio to multiple outputs"""
     
-    def __init__(self):
-        """Initialize audio stream multiplexer"""
+    def __init__(self, converting_collector: Optional[ConvertingBufferCollector] = None):
+        """
+        Initialize audio stream multiplexer.
+        
+        Args:
+            converting_collector: Optional ConvertingBufferCollector for sample rate conversion
+        """
         self._outputs: List[AudioOutput] = []
         self._is_paused = False
         self._buffer_count = 0
         self._lock = asyncio.Lock()
+        self._converting_collector = converting_collector
     
     async def add_output(self, output: AudioOutput) -> None:
         """Add an output"""
@@ -113,6 +131,10 @@ class AudioStreamMultiplexer(AudioStreamDelegate):
             return
         
         self._buffer_count += 1
+        
+        # Add to ConvertingBufferCollector if configured
+        if self._converting_collector:
+            self._converting_collector.add_buffer(buffer)
         
         # Distribute to all outputs
         async with self._lock:
@@ -247,8 +269,18 @@ class AudioCaptureSession(BaseAudioSession):
         self._configuration = configuration
         self._recorder: Optional[StreamingAudioRecorder] = None
         self._outputs: List[AudioOutput] = []
-        self._multiplexer = AudioStreamMultiplexer()
         self._session_format = configuration.format
+        self._converting_collector: Optional[ConvertingBufferCollector] = None
+        
+        # Initialize ConvertingBufferCollector if requested
+        if configuration.use_converting_collector:
+            self._converting_collector = ConvertingBufferCollector(
+                input_format=configuration.format,
+                target_format=configuration.target_format
+            )
+        
+        # Create multiplexer with optional collector
+        self._multiplexer = AudioStreamMultiplexer(self._converting_collector)
     
     async def start(self) -> None:
         """Start capture session"""
@@ -359,6 +391,21 @@ class AudioCaptureSession(BaseAudioSession):
     def get_format(self) -> Optional[AudioFormat]:
         """Get session format"""
         return self._session_format
+    
+    def get_converting_collector(self) -> Optional[ConvertingBufferCollector]:
+        """Get the converting buffer collector if configured"""
+        return self._converting_collector
+    
+    async def get_collected_audio(self) -> Optional[np.ndarray]:
+        """
+        Get all collected audio from the ConvertingBufferCollector.
+        
+        Returns:
+            Converted audio data or None if collector not configured
+        """
+        if self._converting_collector:
+            return self._converting_collector.get_all_audio()
+        return None
 
 
 class AudioPlaybackSession(BaseAudioSession):

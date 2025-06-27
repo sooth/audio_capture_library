@@ -14,8 +14,9 @@ from enum import IntEnum
 from threading import Lock, RLock
 from typing import Optional, List, AsyncIterator, Callable, Tuple
 import numpy as np
+from scipy import signal
 
-from .AudioFormat import AudioBuffer
+from .AudioFormat import AudioBuffer, AudioFormat
 
 
 @dataclass
@@ -449,3 +450,261 @@ class CircularAudioBufferQueue:
             if self._head == self._tail:
                 return None
             return self._buffers[self._head]
+
+
+class ConvertingBufferCollector:
+    """
+    Converting Buffer Collector - Converts audio buffers to target format as they arrive
+    
+    This class implements the same pattern as the macOS ConvertingBufferCollector:
+    1. Convert each buffer to target format as it arrives
+    2. Store all buffers in common format (default: 48kHz stereo)
+    3. Enable mixing of pre-converted buffers without resampling
+    
+    This approach ensures consistent sample rate conversion quality and simplifies
+    mixing operations by handling format conversion at the point of capture.
+    """
+    
+    def __init__(self, 
+                 input_format: AudioFormat, 
+                 target_format: Optional[AudioFormat] = None,
+                 max_buffers: int = 1000):
+        """
+        Initialize the converting buffer collector.
+        
+        Args:
+            input_format: Format of incoming audio buffers
+            target_format: Target format for conversion (default: 48kHz stereo)
+            max_buffers: Maximum number of buffers to store
+        """
+        self.input_format = input_format
+        
+        # Default target format: 48kHz stereo float32
+        if target_format is None:
+            self.target_format = AudioFormat(
+                sample_rate=48000.0,
+                channels=2,
+                bit_depth=32,
+                is_float=True,
+                is_interleaved=True
+            )
+        else:
+            self.target_format = target_format
+        
+        self.max_buffers = max_buffers
+        self._buffers: List[np.ndarray] = []
+        self._lock = Lock()
+        
+        # Pre-calculate conversion parameters
+        self.sample_rate_ratio = self.target_format.sample_rate / self.input_format.sample_rate
+        self.needs_resampling = abs(self.sample_rate_ratio - 1.0) > 0.001
+        
+        # Statistics
+        self._total_buffers_added = 0
+        self._total_frames_converted = 0
+        self._conversion_errors = 0
+        self._cached_total_frames = 0  # Cache frame count
+        
+        print(f"ConvertingBufferCollector initialized:")
+        print(f"  Input: {input_format.sample_rate}Hz, {input_format.channel_count}ch")
+        print(f"  Target: {target_format.sample_rate}Hz, {target_format.channel_count}ch")
+        print(f"  Needs resampling: {self.needs_resampling}")
+        if self.needs_resampling:
+            print(f"  Sample rate ratio: {self.sample_rate_ratio:.6f}")
+    
+    def add_buffer(self, buffer: AudioBuffer) -> None:
+        """
+        Add and convert a buffer to the target format.
+        
+        Args:
+            buffer: Audio buffer to add and convert
+        """
+        with self._lock:
+            # Check buffer limit
+            if len(self._buffers) >= self.max_buffers:
+                # Drop oldest buffer
+                self._buffers.pop(0)
+            
+            # Convert buffer to target format
+            converted = self._convert_buffer(buffer)
+            if converted is not None:
+                self._buffers.append(converted)
+                self._total_buffers_added += 1
+                
+                # Update frame count based on buffer shape
+                if converted.ndim == 2:
+                    # Non-interleaved: frames are first dimension
+                    frame_count = converted.shape[0]
+                elif self.target_format.is_interleaved and self.target_format.channel_count == 2:
+                    # Interleaved stereo
+                    frame_count = len(converted) // 2
+                else:
+                    # Mono or non-standard
+                    frame_count = len(converted)
+                    
+                self._total_frames_converted += frame_count
+                self._cached_total_frames += frame_count
+                
+                # Debug output for first few buffers
+                if self._total_buffers_added <= 3:
+                    print(f"[ConvertingBufferCollector] Buffer {self._total_buffers_added}:")
+                    print(f"  Input: {len(buffer.data)} samples")
+                    print(f"  Output: {len(converted)} samples (shape: {converted.shape if hasattr(converted, 'shape') else 'N/A'})")
+                    print(f"  Frames: {frame_count}")
+                    print(f"  Ratio: {len(converted) / len(buffer.data):.6f}")
+            else:
+                self._conversion_errors += 1
+    
+    def _convert_buffer(self, buffer: AudioBuffer) -> Optional[np.ndarray]:
+        """
+        Convert a single buffer to the target format.
+        
+        Args:
+            buffer: Audio buffer to convert
+            
+        Returns:
+            Converted audio data as numpy array, or None if conversion fails
+        """
+        try:
+            audio_data = buffer.data
+            
+            # Ensure we have a numpy array
+            if not isinstance(audio_data, np.ndarray):
+                # Try to convert to numpy array
+                if hasattr(audio_data, '__array__'):
+                    audio_data = np.asarray(audio_data, dtype=np.float32)
+                else:
+                    # Assume it's a buffer-like object
+                    audio_data = np.frombuffer(audio_data, dtype=np.float32)
+            
+            # Ensure audio_data is at least 1D
+            audio_data = np.atleast_1d(audio_data)
+            
+            # Handle channel conversion first
+            if self.input_format.channel_count != self.target_format.channel_count:
+                if self.input_format.channel_count == 2 and self.target_format.channel_count == 1:
+                    # Stereo to mono
+                    if audio_data.ndim == 2:
+                        # Non-interleaved: shape is (samples, channels)
+                        audio_data = np.mean(audio_data, axis=1)
+                    else:
+                        # Interleaved stereo - ensure we have even number of samples
+                        if len(audio_data) % 2 == 0:
+                            # Deinterleave and average
+                            left = audio_data[0::2]
+                            right = audio_data[1::2]
+                            audio_data = (left + right) / 2.0
+                        else:
+                            # Odd number of samples, just use as-is
+                            print(f"Warning: Odd number of samples for stereo: {len(audio_data)}")
+                elif self.input_format.channel_count == 1 and self.target_format.channel_count == 2:
+                    # Mono to stereo
+                    if audio_data.ndim == 1:
+                        # Duplicate mono to both channels
+                        audio_data = np.column_stack([audio_data, audio_data])
+                        if self.target_format.is_interleaved:
+                            audio_data = audio_data.flatten('C')  # Row-major order for interleaving
+            
+            # Handle sample rate conversion
+            if self.needs_resampling:
+                if audio_data.ndim == 2:
+                    # Non-interleaved multi-channel: resample each channel separately
+                    channels = []
+                    for ch in range(audio_data.shape[1]):
+                        ch_data = audio_data[:, ch]
+                        target_length = int(len(ch_data) * self.sample_rate_ratio)
+                        resampled = signal.resample(ch_data, target_length)
+                        channels.append(resampled)
+                    audio_data = np.column_stack(channels)
+                else:
+                    # Single channel or interleaved
+                    target_length = int(len(audio_data) * self.sample_rate_ratio)
+                    audio_data = signal.resample(audio_data, target_length)
+            
+            # Ensure float32 format
+            if audio_data.dtype != np.float32:
+                audio_data = audio_data.astype(np.float32)
+            
+            # Final step: ensure output matches target format's interleaving
+            if audio_data.ndim == 2:
+                if self.target_format.is_interleaved:
+                    # Convert non-interleaved to interleaved
+                    audio_data = audio_data.flatten('C')  # Row-major for proper interleaving
+                # else: already non-interleaved, which is what we want
+            elif audio_data.ndim == 1 and not self.target_format.is_interleaved and self.target_format.channel_count == 2:
+                # Convert interleaved to non-interleaved stereo
+                if len(audio_data) % 2 == 0:
+                    audio_data = audio_data.reshape(-1, 2)
+            
+            return audio_data
+            
+        except Exception as e:
+            print(f"[ConvertingBufferCollector] Error converting buffer: {e}")
+            if self._conversion_errors == 0:
+                # Print detailed error info for first error
+                import traceback
+                traceback.print_exc()
+            return None
+    
+    def get_all_buffers(self) -> List[np.ndarray]:
+        """
+        Get all converted buffers.
+        
+        Returns:
+            List of converted audio buffers
+        """
+        with self._lock:
+            return self._buffers.copy()
+    
+    def get_all_audio(self) -> np.ndarray:
+        """
+        Get all converted audio as a single array.
+        
+        Returns:
+            Concatenated audio data in target format
+        """
+        with self._lock:
+            if not self._buffers:
+                return np.array([], dtype=np.float32)
+            
+            # All buffers are already converted - just concatenate
+            return np.concatenate(self._buffers)
+    
+    def clear(self) -> None:
+        """Clear all buffers"""
+        with self._lock:
+            self._buffers.clear()
+            self._total_buffers_added = 0
+            self._total_frames_converted = 0
+            self._cached_total_frames = 0
+    
+    @property
+    def buffer_count(self) -> int:
+        """Get number of buffers collected"""
+        with self._lock:
+            return len(self._buffers)
+    
+    @property
+    def total_frames(self) -> int:
+        """Get total number of frames collected"""
+        with self._lock:
+            return self._cached_total_frames
+    
+    @property
+    def duration(self) -> float:
+        """Get total duration in seconds"""
+        # Use cached frame count directly
+        return self._cached_total_frames / self.target_format.sample_rate
+    
+    def get_statistics(self) -> dict:
+        """Get collector statistics"""
+        with self._lock:
+            return {
+                'buffer_count': len(self._buffers),
+                'total_buffers_added': self._total_buffers_added,
+                'total_frames_converted': self._total_frames_converted,
+                'duration': self.duration,
+                'input_format': f"{self.input_format.sample_rate}Hz/{self.input_format.channel_count}ch",
+                'target_format': f"{self.target_format.sample_rate}Hz/{self.target_format.channel_count}ch",
+                'conversion_errors': self._conversion_errors
+            }

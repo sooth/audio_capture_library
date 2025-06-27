@@ -15,7 +15,7 @@ import struct
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional, Set
+from typing import List, Optional, Set, AsyncIterator
 import numpy as np
 
 from .AudioFormat import AudioFormat, AudioBuffer
