@@ -16,11 +16,40 @@ Key Features:
 import asyncio
 import threading
 import time
+import sys
 from datetime import datetime
 from typing import Optional, List, Callable, Union
 import numpy as np
-import pyaudiowpatch as pyaudio
 import sounddevice as sd
+
+# Try to import PyAudioWPatch for loopback support
+LOOPBACK_SUPPORTED = False
+pyaudio = None
+
+# First, try to import pyaudiowpatch
+try:
+    import pyaudiowpatch
+    pyaudio = pyaudiowpatch
+    
+    # Verify it has loopback support by checking for the method
+    test_p = pyaudio.PyAudio()
+    try:
+        # Check if it has the loopback device generator method
+        if hasattr(test_p, 'get_loopback_device_info_generator'):
+            LOOPBACK_SUPPORTED = True
+            print("PyAudioWPatch detected with loopback support")
+        else:
+            print("PyAudioWPatch found but no loopback support detected")
+    finally:
+        test_p.terminate()
+except ImportError:
+    # Fall back to regular pyaudio if available
+    try:
+        import pyaudio as regular_pyaudio
+        pyaudio = regular_pyaudio
+        print("Warning: PyAudioWPatch not found, using regular PyAudio (no loopback support)")
+    except ImportError:
+        print("Warning: Neither PyAudioWPatch nor PyAudio found")
 
 from .AudioFormat import AudioFormat, AudioBuffer
 from .AudioDevice import AudioDevice, DeviceType
@@ -77,12 +106,14 @@ class StreamingAudioRecorder:
         Initialize streaming audio recorder.
         
         Args:
-            sample_rate: Sample rate in Hz
+            sample_rate: Sample rate in Hz (fallback, actual device rate will be detected)
             channels: Number of channels
             blocksize: Audio block size
             device: Audio device to use (None for default)
         """
-        self.sample_rate = sample_rate
+        self.requested_sample_rate = sample_rate  # What was requested
+        self.actual_sample_rate = sample_rate     # What device actually uses
+        self.sample_rate = sample_rate            # For backward compatibility
         self.channels = channels
         self.blocksize = blocksize
         self.device = device
@@ -195,49 +226,111 @@ class StreamingAudioRecorder:
         """Start capturing system audio using loopback"""
         print(f"[{self._timestamp()}] StreamingAudioRecorder: Starting loopback capture")
         
+        if not LOOPBACK_SUPPORTED:
+            raise AudioLoopbackPermissionError(
+                "Loopback recording is not available. "
+                "Please install PyAudioWPatch: pip install PyAudioWPatch"
+            )
+        
         # Initialize PyAudioWPatch
         self._pyaudio = pyaudio.PyAudio()
         
         # Find the loopback device
-        loopback_device_index = None
-        if self.device and hasattr(self.device, 'device_index'):
-            # Use specified device
-            loopback_device_index = self.device.device_index
+        loopback_device = None
+        
+        if self.device and self.device.type == DeviceType.LOOPBACK:
+            # Use the provided loopback device
+            # The device should already have the correct PyAudioWPatch index
+            device_name = self.device.name
+            
+            # Find the PyAudioWPatch loopback device
+            for i in range(self._pyaudio.get_device_count()):
+                info = self._pyaudio.get_device_info_by_index(i)
+                # Check if it's a loopback device with matching name
+                if (info.get('isLoopbackDevice', False) and 
+                    (device_name in info['name'] or info['name'] in device_name)):
+                    loopback_device = info
+                    break
+            
+            # If not found, try the loopback generator
+            if not loopback_device:
+                for loopback in self._pyaudio.get_loopback_device_info_generator():
+                    if device_name in loopback['name'] or loopback['name'] in device_name:
+                        loopback_device = loopback
+                        break
         else:
-            # Find default output device for loopback
+            # Find default output device and its loopback
             try:
-                default_speakers = self._pyaudio.get_default_output_device_info()
-                loopback_device_index = default_speakers["index"]
+                # Get WASAPI info
+                wasapi_info = self._pyaudio.get_host_api_info_by_type(pyaudio.paWASAPI)
+                default_speakers = self._pyaudio.get_device_info_by_index(
+                    wasapi_info["defaultOutputDevice"]
+                )
+                
+                print(f"[{self._timestamp()}] StreamingAudioRecorder: Default output device is '{default_speakers['name']}'")
+                
+                # If it's not already a loopback device, find the matching loopback
+                if not default_speakers.get("isLoopbackDevice", False):
+                    # Look for exact match first, then partial match
+                    for loopback in self._pyaudio.get_loopback_device_info_generator():
+                        # Exact match (device name is contained in loopback name)
+                        if default_speakers["name"] in loopback["name"]:
+                            loopback_device = loopback
+                            print(f"[{self._timestamp()}] StreamingAudioRecorder: Found exact match loopback: '{loopback['name']}'")
+                            break
+                    
+                    # If no exact match, try to find by common words
+                    if not loopback_device:
+                        default_words = set(default_speakers["name"].lower().split())
+                        best_match = None
+                        best_score = 0
+                        
+                        for loopback in self._pyaudio.get_loopback_device_info_generator():
+                            loopback_words = set(loopback["name"].lower().split())
+                            common_words = default_words & loopback_words
+                            score = len(common_words)
+                            
+                            if score > best_score:
+                                best_score = score
+                                best_match = loopback
+                        
+                        if best_match and best_score > 0:
+                            loopback_device = best_match
+                            print(f"[{self._timestamp()}] StreamingAudioRecorder: Found partial match loopback: '{loopback_device['name']}'")
+                else:
+                    loopback_device = default_speakers
+                    
             except Exception as e:
-                raise DeviceNotFoundError("Default output device") from e
+                raise DeviceNotFoundError("Default loopback device") from e
         
-        if loopback_device_index is None:
-            raise DeviceNotFoundError("Loopback device")
+        if not loopback_device:
+            raise DeviceNotFoundError("Loopback device not found")
         
-        # Get device info
-        device_info = self._pyaudio.get_device_info_by_index(loopback_device_index)
-        print(f"[{self._timestamp()}] StreamingAudioRecorder: Using device '{device_info['name']}' for loopback")
+        # Store the actual sample rate being used
+        self.actual_sample_rate = int(loopback_device["defaultSampleRate"])
         
-        # Open loopback stream
+        print(f"[{self._timestamp()}] StreamingAudioRecorder: Using loopback device '{loopback_device['name']}'")
+        print(f"[{self._timestamp()}]   Channels: {loopback_device['maxInputChannels']}")
+        print(f"[{self._timestamp()}]   Actual Sample Rate: {self.actual_sample_rate}Hz")
+        print(f"[{self._timestamp()}]   Requested Sample Rate: {self.requested_sample_rate}Hz")
+        
+        # Open loopback stream at device's native rate
         try:
             self._stream = self._pyaudio.open(
                 format=pyaudio.paFloat32,
-                channels=self.channels,
-                rate=self.sample_rate,
+                channels=min(self.channels, loopback_device["maxInputChannels"]),
+                rate=self.actual_sample_rate,
                 input=True,
-                input_device_index=loopback_device_index,
+                input_device_index=loopback_device["index"],
                 frames_per_buffer=self.blocksize,
-                stream_callback=self._pyaudio_callback,
-                as_loopback=True  # Enable loopback mode
+                stream_callback=self._pyaudio_callback
             )
             
             self._stream.start_stream()
+            print(f"[{self._timestamp()}] StreamingAudioRecorder: Loopback stream started successfully")
             
         except Exception as e:
-            if "as_loopback" in str(e):
-                raise AudioLoopbackPermissionError()
-            else:
-                raise SessionStartFailedError(str(e))
+            raise SessionStartFailedError(f"Failed to start loopback capture: {e}")
     
     async def _start_microphone_capture(self) -> None:
         """Start capturing from microphone"""
@@ -248,10 +341,22 @@ class StreamingAudioRecorder:
         if self.device and hasattr(self.device, 'device_index'):
             device_index = self.device.device_index
         
-        # Open sounddevice stream
+        # Get the device's reported default sample rate
+        if device_index is not None:
+            try:
+                device_info = sd.query_devices(device_index)
+                device_default_rate = int(device_info['default_samplerate'])
+                print(f"[{self._timestamp()}] StreamingAudioRecorder: Device reports default rate: {device_default_rate}Hz")
+            except Exception as e:
+                print(f"[{self._timestamp()}] StreamingAudioRecorder: Could not query device rate: {e}")
+                device_default_rate = self.requested_sample_rate
+        else:
+            device_default_rate = self.requested_sample_rate
+        
+        # Open sounddevice stream and let it choose the rate, then get the actual rate
         try:
             self._stream = sd.InputStream(
-                samplerate=self.sample_rate,
+                samplerate=None,  # Let sounddevice choose the best rate
                 channels=self.channels,
                 device=device_index,
                 blocksize=self.blocksize,
@@ -260,6 +365,13 @@ class StreamingAudioRecorder:
             )
             
             self._stream.start()
+            
+            # Get the ACTUAL sample rate that the stream is using
+            self.actual_sample_rate = int(self._stream.samplerate)
+            print(f"[{self._timestamp()}] StreamingAudioRecorder: Stream opened successfully")
+            print(f"[{self._timestamp()}] StreamingAudioRecorder: Requested rate: {self.requested_sample_rate}Hz")
+            print(f"[{self._timestamp()}] StreamingAudioRecorder: Device default rate: {device_default_rate}Hz")
+            print(f"[{self._timestamp()}] StreamingAudioRecorder: ACTUAL stream rate: {self.actual_sample_rate}Hz")
             
         except Exception as e:
             raise SessionStartFailedError(str(e))
