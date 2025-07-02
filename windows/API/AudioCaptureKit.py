@@ -379,7 +379,14 @@ class AudioCaptureKit:
     def __del__(self):
         """Cleanup on deletion"""
         try:
-            asyncio.run(self.cleanup())
+            # Try to get the current event loop
+            try:
+                loop = asyncio.get_running_loop()
+                # Schedule the cleanup coroutine on the existing loop
+                loop.create_task(self.cleanup())
+            except RuntimeError:
+                # No running loop, create a new one
+                asyncio.run(self.cleanup())
         except Exception:
             pass
 
