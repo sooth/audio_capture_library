@@ -125,11 +125,14 @@ class PermissionDeniedError(AudioCaptureError):
 
 class AudioLoopbackPermissionError(AudioCaptureError):
     """System audio loopback permission required"""
-    def __init__(self):
-        super().__init__(
-            "System audio loopback permission is required. "
-            "This feature requires Windows 10 version 1803 or later"
-        )
+    def __init__(self, message=None):
+        if message:
+            super().__init__(message)
+        else:
+            super().__init__(
+                "System audio loopback permission is required. "
+                "This feature requires Windows 10 version 1803 or later"
+            )
     
     @property
     def failure_reason(self) -> str:
