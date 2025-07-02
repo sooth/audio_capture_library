@@ -14,7 +14,13 @@ import uuid
 
 try:
     import sounddevice as sd
-    import pyaudiowpatch as pyaudio  # For loopback support
+    try:
+        import pyaudiowpatch as pyaudio  # For loopback support
+        HAS_PYAUDIOWPATCH = True
+    except ImportError:
+        import pyaudio  # Fall back to regular PyAudio
+        HAS_PYAUDIOWPATCH = False
+        print("Warning: PyAudioWPatch not found, loopback recording will not be available")
     from pycaw.pycaw import AudioUtilities, IMMDeviceEnumerator, EDataFlow, ERole, DEVICE_STATE
 except ImportError as e:
     print(f"Required audio libraries not installed: {e}")
@@ -148,16 +154,7 @@ class AudioDeviceManager:
     def get_recording_devices(self) -> List[AudioDevice]:
         """Get all available recording devices (including loopback)"""
         self._refresh_device_list_if_needed()
-        devices = [d for d in self._cached_devices if d.type in (DeviceType.INPUT, DeviceType.LOOPBACK)]
-        
-        # Add loopback devices for each output device
-        output_devices = [d for d in self._cached_devices if d.type == DeviceType.OUTPUT]
-        for output_device in output_devices:
-            loopback_device = self._create_loopback_device(output_device)
-            if loopback_device:
-                devices.append(loopback_device)
-        
-        return devices
+        return [d for d in self._cached_devices if d.type in (DeviceType.INPUT, DeviceType.LOOPBACK)]
     
     def get_device_by_id(self, device_id: str) -> Optional[AudioDevice]:
         """Get device by ID"""
@@ -233,6 +230,17 @@ class AudioDeviceManager:
                 except Exception as e:
                     print(f"Failed to create AudioDevice for index {idx}: {e}")
             
+            # If PyAudioWPatch is available, add loopback devices
+            if HAS_PYAUDIOWPATCH and hasattr(self._pyaudio, 'get_loopback_device_info_generator'):
+                try:
+                    # Get loopback devices from PyAudioWPatch
+                    for loopback_info in self._pyaudio.get_loopback_device_info_generator():
+                        loopback_device = self._create_loopback_device_from_pyaudiowpatch(loopback_info)
+                        if loopback_device:
+                            devices.append(loopback_device)
+                except Exception as e:
+                    print(f"Error enumerating loopback devices: {e}")
+            
             self._cached_devices = devices
             self._last_scan_time = datetime.now()
             
@@ -296,45 +304,59 @@ class AudioDeviceManager:
             host_api=host_api
         )
     
-    def _create_loopback_device(self, output_device: AudioDevice) -> Optional[AudioDevice]:
-        """Create a loopback device from an output device"""
-        if not output_device.capabilities.supports_loopback:
-            return None
-        
-        # Check if PyAudioWPatch supports this device for loopback
+    def _create_loopback_device_from_pyaudiowpatch(self, loopback_info: Dict[str, Any]) -> Optional[AudioDevice]:
+        """Create a loopback device from PyAudioWPatch info"""
         try:
-            # Find the corresponding PyAudio device
-            pa_info = None
-            for i in range(self._pyaudio.get_device_count()):
-                info = self._pyaudio.get_device_info_by_index(i)
-                if info['name'] == output_device.name and info['maxOutputChannels'] > 0:
-                    pa_info = info
-                    break
+            # Generate unique ID
+            device_id = f"loopback_{loopback_info['index']}_{loopback_info['name'].replace(' ', '_')}"
             
-            if not pa_info:
-                return None
+            # Get supported formats (use common formats for loopback)
+            supported_formats = [
+                AudioFormat(
+                    sample_rate=float(loopback_info['defaultSampleRate']),
+                    channel_count=loopback_info['maxInputChannels'],
+                    bit_depth=16,
+                    is_interleaved=True,
+                    is_float=False
+                ),
+                AudioFormat(
+                    sample_rate=float(loopback_info['defaultSampleRate']),
+                    channel_count=loopback_info['maxInputChannels'],
+                    bit_depth=32,
+                    is_interleaved=True,
+                    is_float=True
+                )
+            ]
+            
+            # Get host API
+            host_api_info = self._pyaudio.get_host_api_info_by_index(loopback_info['hostApi'])
+            host_api = self._get_device_api(host_api_info['name'])
+            
+            # Create capabilities
+            capabilities = DeviceCapabilities(
+                hardware_monitoring=False,
+                exclusive_mode=False,
+                min_latency=loopback_info.get('defaultLowInputLatency', 0.020),
+                max_channels=loopback_info['maxInputChannels'],
+                sample_rates=[float(loopback_info['defaultSampleRate'])],
+                supports_loopback=True
+            )
             
             return AudioDevice(
-                id=f"loopback_{output_device.id}",
-                name=f"{output_device.name} (Loopback)",
-                manufacturer=output_device.manufacturer,
+                id=device_id,
+                name=loopback_info['name'],
+                manufacturer=None,
                 type=DeviceType.LOOPBACK,
-                device_index=output_device.device_index,
-                wasapi_id=output_device.wasapi_id,
-                supported_formats=output_device.supported_formats,
+                device_index=loopback_info['index'],  # PyAudioWPatch index
+                wasapi_id=None,
+                supported_formats=supported_formats,
                 is_default=False,
-                status=output_device.status,
-                capabilities=DeviceCapabilities(
-                    hardware_monitoring=False,
-                    exclusive_mode=False,
-                    min_latency=0.020,
-                    max_channels=output_device.capabilities.max_channels,
-                    sample_rates=output_device.capabilities.sample_rates,
-                    supports_loopback=True
-                ),
-                host_api=output_device.host_api
+                status=DeviceStatus.CONNECTED,
+                capabilities=capabilities,
+                host_api=host_api
             )
-        except Exception:
+        except Exception as e:
+            print(f"Error creating loopback device: {e}")
             return None
     
     def _get_device_api(self, api_name: str) -> DeviceAPI:
